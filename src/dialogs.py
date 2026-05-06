@@ -18,9 +18,10 @@ def open_settings(app):
     win = tk.Toplevel(app.root)
     win.title("Settings — Custom Actions")
     win.configure(bg=T["bg"])
-    win.geometry("520x420")
     win.minsize(420, 300)
     win.grab_set()
+    app.root.update_idletasks()
+    win.geometry(f"520x420+{app.root.winfo_x() + 40}+{app.root.winfo_y() + 40}")
 
     tk.Label(win, text="Custom Actions", bg=T["bg"], fg=T["title"],
              font=("Helvetica Neue", 16, "bold"),
@@ -141,9 +142,10 @@ def show_package_picker(parent: tk.Misc, packages: list[str],
     win = tk.Toplevel(parent)
     win.title("Select package")
     win.configure(bg=T["bg"])
-    win.geometry("460x420")
     win.transient(parent)
     win.grab_set()
+    parent.update_idletasks()
+    win.geometry(f"460x420+{parent.winfo_x() + 60}+{parent.winfo_y() + 60}")
 
     # Filter
     filter_var = tk.StringVar()

@@ -28,9 +28,15 @@ class LogcatViewer:
         self.win = win
         win.title("Logcat")
         win.configure(bg=T["bg"])
-        win.geometry("980x620")
         win.minsize(720, 400)
         win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Place on the same monitor as the main window — without an explicit
+        # +x+y the WM often drops the Toplevel onto the primary display.
+        app.root.update_idletasks()
+        x = app.root.winfo_x() + 40
+        y = app.root.winfo_y() + 40
+        win.geometry(f"980x620+{x}+{y}")
 
         self._build(win)
 

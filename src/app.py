@@ -361,8 +361,13 @@ class APKInstaller:
         threading.Thread(target=run, daemon=True).start()
 
     def _launch_scrcpy(self):
-        cmd = ["scrcpy"] + (["-s", self.selected_device.get()]
-                             if self.selected_device.get() else [])
+        # Pin scrcpy's window to the same screen as the main app
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + 60
+        y = self.root.winfo_y() + 60
+        cmd = ["scrcpy", f"--window-x={x}", f"--window-y={y}"]
+        if self.selected_device.get():
+            cmd += ["-s", self.selected_device.get()]
         self._log(f"Launching: {' '.join(cmd)}", "info")
         threading.Thread(target=lambda: subprocess.Popen(cmd), daemon=True).start()
 

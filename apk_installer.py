@@ -2,6 +2,8 @@
 """APK Installer — install APKs via adb and launch scrcpy from a GUI."""
 
 import json
+import re
+import signal
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 import subprocess
@@ -10,7 +12,11 @@ import time
 from pathlib import Path
 from datetime import datetime
 
-SETTINGS_FILE = Path.home() / ".apk_installer_settings.json"
+ROOT_DIR        = Path(__file__).resolve().parent
+SETTINGS_FILE   = ROOT_DIR / ".apk_installer_settings.json"
+CAPTURES_DIR    = ROOT_DIR / "captures"
+REMOTE_REC_PATH = "/sdcard/_adbgui_rec.mp4"
+RECENT_LIMIT    = 10
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -81,7 +87,13 @@ class APKInstaller:
         self.selected_apk = tk.StringVar()
         self.selected_device = tk.StringVar()
         self.devices: list[str] = []
-        self.custom_actions: list[dict] = self._load_settings()
+
+        settings = self._load_settings()
+        self.custom_actions: list[dict] = settings.get("custom_actions", [])
+        self.recent_apks:    list[str]  = settings.get("recent_apks", [])
+
+        self.recording_proc: subprocess.Popen | None = None
+        self.logcat_win = None
 
         self._build_ui()
         self._refresh_devices()
@@ -89,6 +101,7 @@ class APKInstaller:
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
+        self._setup_ttk_style()
         # Header
         hdr = tk.Frame(self.root, bg=T["bg"], pady=12)
         hdr.pack(fill=tk.X, padx=24)
@@ -96,6 +109,8 @@ class APKInstaller:
                  font=("Helvetica Neue", 22, "bold")).pack(side=tk.LEFT)
         self._btn(hdr, "⚙  Settings", self._open_settings,
                   variant="secondary").pack(side=tk.RIGHT)
+        self._btn(hdr, "🪵  Logcat", self._open_logcat,
+                  variant="secondary").pack(side=tk.RIGHT, padx=(0, 8))
 
         # Body row
         body = tk.Frame(self.root, bg=T["bg"])
@@ -112,6 +127,7 @@ class APKInstaller:
 
         self._build_drop_zone(left)
         self._build_file_strip(left)
+        self._build_uninstall_panel(left)
         self._build_sidebar(right)
         self._build_log_panel(self.root)
 
@@ -163,14 +179,42 @@ class APKInstaller:
         self._btn(row, "Browse…", self._browse, variant="secondary").pack(side=tk.LEFT, padx=(0, 6))
         self._btn(row, "Clear", self._clear_selection, variant="secondary").pack(side=tk.LEFT)
 
-    def _build_sidebar(self, parent):
-        pad = tk.Frame(parent, bg=T["surface"], padx=14, pady=14)
-        pad.pack(fill=tk.BOTH, expand=True)
+        # Recent APKs dropdown — only shown when the list is non-empty
+        self.recent_var  = tk.StringVar()
+        self.recent_menu = ttk.Combobox(
+            inner, textvariable=self.recent_var,
+            state="readonly", font=("Menlo", 10),
+            style="Dark.TCombobox")
+        self.recent_menu.bind("<<ComboboxSelected>>",
+                              lambda _: self._on_recent_picked())
+        self._refresh_recent_menu()
 
-        # Devices
-        tk.Label(pad, text="DEVICE", bg=T["surface"], fg=T["subtext"],
+    def _build_uninstall_panel(self, parent):
+        frame = tk.Frame(parent, bg=T["surface"],
+                         highlightbackground=T["border"], highlightthickness=1)
+        frame.pack(fill=tk.X, pady=(0, 10))
+
+        inner = tk.Frame(frame, bg=T["surface"], padx=12, pady=10)
+        inner.pack(fill=tk.X)
+
+        tk.Label(inner, text="UNINSTALL APP", bg=T["surface"], fg=T["subtext"],
                  font=("Helvetica Neue", 9)).pack(anchor=tk.W)
 
+        self.uninstall_var = tk.StringVar()
+        entry = tk.Entry(inner, textvariable=self.uninstall_var,
+                         bg=T["raised"], fg=T["text"], insertbackground=T["text"],
+                         relief=tk.FLAT, font=("Menlo", 11),
+                         highlightbackground=T["border"], highlightthickness=1)
+        entry.pack(fill=tk.X, pady=(4, 6))
+
+        row = tk.Frame(inner, bg=T["surface"])
+        row.pack(anchor=tk.W)
+        self._btn(row, "Pick from device…", self._pick_package,
+                  variant="secondary").pack(side=tk.LEFT, padx=(0, 6))
+        self._btn(row, "Uninstall", self._uninstall_package,
+                  variant="close").pack(side=tk.LEFT)
+
+    def _setup_ttk_style(self):
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Dark.TCombobox",
@@ -181,6 +225,14 @@ class APKInstaller:
         style.map("Dark.TCombobox",
                   fieldbackground=[("readonly", T["input"])],
                   background=[("active", T["raised"])])
+
+    def _build_sidebar(self, parent):
+        pad = tk.Frame(parent, bg=T["surface"], padx=14, pady=14)
+        pad.pack(fill=tk.BOTH, expand=True)
+
+        # Devices
+        tk.Label(pad, text="DEVICE", bg=T["surface"], fg=T["subtext"],
+                 font=("Helvetica Neue", 9)).pack(anchor=tk.W)
 
         self.device_menu = ttk.Combobox(
             pad, textvariable=self.selected_device,
@@ -208,6 +260,17 @@ class APKInstaller:
         self.close_btn = self._btn(pad, "🔌  Close Wi-Fi ADB", self._close_wifi_adb,
                                    variant="close")
         self.selected_device.trace_add("write", lambda *_: self._update_close_btn())
+
+        # Capture section
+        tk.Frame(pad, bg=T["border"], height=1).pack(fill=tk.X, pady=(14, 0))
+        tk.Label(pad, text="CAPTURE", bg=T["surface"], fg=T["subtext"],
+                 font=("Helvetica Neue", 9)).pack(anchor=tk.W, pady=(10, 6))
+
+        self._btn(pad, "📸  Screenshot", self._take_screenshot,
+                  variant="secondary").pack(fill=tk.X, pady=(0, 6))
+        self.record_btn = self._btn(pad, "🔴  Record Screen", self._toggle_recording,
+                                    variant="close")
+        self.record_btn.pack(fill=tk.X)
 
         # Custom action buttons (rebuilt whenever settings change)
         self.custom_sep = tk.Frame(pad, bg=T["border"], height=1)
@@ -345,7 +408,11 @@ class APKInstaller:
             self._log("No APK selected", "error")
             return
         cmd = self._adb_prefix() + ["install", "-r", apk]
-        self._run_async(cmd, success_msg="✓ Install complete")
+
+        def run():
+            if self._exec(cmd, success_msg="✓ Install complete"):
+                self.root.after(0, lambda: self._add_recent(apk))
+        threading.Thread(target=run, daemon=True).start()
 
     def _launch_scrcpy(self):
         cmd = ["scrcpy"] + (["-s", self.selected_device.get()]
@@ -362,6 +429,7 @@ class APKInstaller:
 
         def run():
             if self._exec(cmd, success_msg="✓ Install complete"):
+                self.root.after(0, lambda: self._add_recent(apk))
                 self.root.after(0, self._launch_scrcpy)
 
         threading.Thread(target=run, daemon=True).start()
@@ -468,6 +536,193 @@ class APKInstaller:
             self.root.after(0, lambda: self._log(f"Error: {e}", "error"))
             return False
 
+    # ── Recent APKs ───────────────────────────────────────────────────────────
+
+    def _add_recent(self, apk: str):
+        if apk in self.recent_apks:
+            self.recent_apks.remove(apk)
+        self.recent_apks.insert(0, apk)
+        del self.recent_apks[RECENT_LIMIT:]
+        self._save_settings()
+        self._refresh_recent_menu()
+
+    def _refresh_recent_menu(self):
+        # Drop entries whose files no longer exist
+        self.recent_apks[:] = [p for p in self.recent_apks if Path(p).exists()]
+        if not self.recent_apks:
+            self.recent_menu.pack_forget()
+            return
+        self.recent_menu["values"] = self.recent_apks
+        self.recent_menu.pack(fill=tk.X, pady=(8, 0))
+
+    def _on_recent_picked(self):
+        path = self.recent_var.get()
+        if path:
+            self._resolve_and_set(path)
+            self.recent_var.set("")  # don't keep it stuck on the dropdown
+
+    # ── Uninstall ─────────────────────────────────────────────────────────────
+
+    def _uninstall_package(self):
+        pkg = self.uninstall_var.get().strip()
+        if not pkg:
+            self._log("Enter a package name to uninstall", "error")
+            return
+        self._run_async(self._adb_prefix() + ["uninstall", pkg],
+                        success_msg=f"✓ Uninstalled {pkg}")
+
+    def _pick_package(self):
+        """Fetch installed packages and let the user pick one."""
+        def run():
+            try:
+                r = subprocess.run(
+                    self._adb_prefix() + ["shell", "pm", "list", "packages"],
+                    capture_output=True, text=True, timeout=10)
+                pkgs = sorted(
+                    line.removeprefix("package:").strip()
+                    for line in r.stdout.splitlines()
+                    if line.startswith("package:"))
+                if not pkgs:
+                    self.root.after(0, lambda: self._log(
+                        "No packages found on device", "warn"))
+                    return
+                self.root.after(0, lambda: self._show_package_picker(pkgs))
+            except Exception as e:
+                self.root.after(0, lambda: self._log(f"pm list failed: {e}", "error"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_package_picker(self, packages: list[str]):
+        win = tk.Toplevel(self.root)
+        win.title("Select package")
+        win.configure(bg=T["bg"])
+        win.geometry("460x420")
+        win.transient(self.root)
+        win.grab_set()
+
+        # Filter box
+        filter_var = tk.StringVar()
+        top = tk.Frame(win, bg=T["bg"], padx=14, pady=12)
+        top.pack(fill=tk.X)
+        tk.Label(top, text="Filter:", bg=T["bg"], fg=T["text"],
+                 font=("Helvetica Neue", 11)).pack(side=tk.LEFT)
+        tk.Entry(top, textvariable=filter_var,
+                 bg=T["raised"], fg=T["text"], insertbackground=T["text"],
+                 relief=tk.FLAT, font=("Menlo", 11),
+                 highlightbackground=T["border"], highlightthickness=1,
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        # Listbox
+        body = tk.Frame(win, bg=T["bg"], padx=14)
+        body.pack(fill=tk.BOTH, expand=True, pady=(0, 14))
+        lb = tk.Listbox(body, bg=T["input"], fg=T["text"],
+                        selectbackground=T["btn_install_bg"],
+                        selectforeground="#ffffff",
+                        font=("Menlo", 11), relief=tk.FLAT, bd=0,
+                        highlightthickness=1, highlightbackground=T["border"])
+        sb = tk.Scrollbar(body, command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def repopulate(*_):
+            needle = filter_var.get().lower()
+            lb.delete(0, tk.END)
+            for p in packages:
+                if needle in p.lower():
+                    lb.insert(tk.END, p)
+        filter_var.trace_add("write", repopulate)
+        repopulate()
+
+        def choose(_=None):
+            sel = lb.curselection()
+            if sel:
+                self.uninstall_var.set(lb.get(sel[0]))
+                win.destroy()
+
+        lb.bind("<Double-Button-1>", choose)
+
+        btn_row = tk.Frame(win, bg=T["bg"], padx=14)
+        btn_row.pack(fill=tk.X, pady=(0, 14))
+        self._btn(btn_row, "Select", choose,
+                  variant="install").pack(side=tk.RIGHT, padx=(6, 0))
+        self._btn(btn_row, "Cancel", win.destroy,
+                  variant="secondary").pack(side=tk.RIGHT)
+
+    # ── Capture: screenshot & screen record ───────────────────────────────────
+
+    def _take_screenshot(self):
+        CAPTURES_DIR.mkdir(exist_ok=True)
+        out_path = CAPTURES_DIR / f"screen_{datetime.now():%Y%m%d_%H%M%S}.png"
+
+        def run():
+            self.root.after(0, lambda: self._log("Taking screenshot…", "info"))
+            try:
+                with open(out_path, "wb") as f:
+                    proc = subprocess.run(
+                        self._adb_prefix() + ["exec-out", "screencap", "-p"],
+                        stdout=f, stderr=subprocess.PIPE, timeout=20)
+                if proc.returncode == 0 and out_path.stat().st_size > 0:
+                    self.root.after(0, lambda: self._log(
+                        f"✓ Saved {out_path.relative_to(ROOT_DIR)}", "success"))
+                else:
+                    out_path.unlink(missing_ok=True)
+                    self.root.after(0, lambda: self._log(
+                        "Screenshot failed (empty output)", "error"))
+            except Exception as e:
+                out_path.unlink(missing_ok=True)
+                self.root.after(0, lambda: self._log(f"Screenshot error: {e}", "error"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _toggle_recording(self):
+        if self.recording_proc is None:
+            self._start_recording()
+        else:
+            self._stop_recording()
+
+    def _start_recording(self):
+        try:
+            self.recording_proc = subprocess.Popen(
+                self._adb_prefix() + ["shell", "screenrecord", REMOTE_REC_PATH])
+            self.record_btn.config(text="⏹  Stop Recording")
+            self._log("● Recording — max 3 min on Android", "info")
+        except Exception as e:
+            self._log(f"Failed to start recording: {e}", "error")
+            self.recording_proc = None
+
+    def _stop_recording(self):
+        proc = self.recording_proc
+        self.recording_proc = None
+        self.record_btn.config(text="🔴  Record Screen")
+
+        def run():
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=4)
+            except Exception:
+                # Belt-and-braces: kill on device, then locally
+                subprocess.run(self._adb_prefix() + ["shell", "killall", "-2", "screenrecord"],
+                               capture_output=True, timeout=5)
+                try: proc.wait(timeout=3)
+                except Exception: proc.kill()
+
+            time.sleep(1)  # let the device finalise the mp4
+            CAPTURES_DIR.mkdir(exist_ok=True)
+            local = CAPTURES_DIR / f"rec_{datetime.now():%Y%m%d_%H%M%S}.mp4"
+            ok = self._exec(self._adb_prefix() + ["pull", REMOTE_REC_PATH, str(local)],
+                            success_msg=f"✓ Saved {local.relative_to(ROOT_DIR)}")
+            if ok:
+                subprocess.run(self._adb_prefix() + ["shell", "rm", REMOTE_REC_PATH],
+                               capture_output=True, timeout=5)
+        threading.Thread(target=run, daemon=True).start()
+
+    # ── Logcat viewer ─────────────────────────────────────────────────────────
+
+    def _open_logcat(self):
+        if self.logcat_win is not None and self.logcat_win.winfo_exists():
+            self.logcat_win.lift()
+            return
+        LogcatViewer(self)
+
     # ── Custom actions ────────────────────────────────────────────────────────
 
     def _rebuild_custom_buttons(self):
@@ -498,16 +753,21 @@ class APKInstaller:
 
     # ── Settings ──────────────────────────────────────────────────────────────
 
-    def _load_settings(self) -> list[dict]:
+    def _load_settings(self) -> dict:
         try:
             data = json.loads(SETTINGS_FILE.read_text())
-            return data.get("custom_actions", [])
+            # Back-compat: older versions wrote a bare list under no key
+            if isinstance(data, list):
+                return {"custom_actions": data, "recent_apks": []}
+            return data
         except Exception:
-            return []
+            return {}
 
     def _save_settings(self):
-        SETTINGS_FILE.write_text(
-            json.dumps({"custom_actions": self.custom_actions}, indent=2))
+        SETTINGS_FILE.write_text(json.dumps({
+            "custom_actions": self.custom_actions,
+            "recent_apks":    self.recent_apks,
+        }, indent=2))
 
     def _open_settings(self):
         win = tk.Toplevel(self.root)
@@ -645,6 +905,199 @@ class APKInstaller:
         self.log.config(state=tk.NORMAL)
         self.log.delete("1.0", tk.END)
         self.log.config(state=tk.DISABLED)
+
+
+# ── Logcat viewer ─────────────────────────────────────────────────────────────
+
+# logcat -v time line:  "MM-DD hh:mm:ss.SSS L/Tag(  pid): message"
+LOGCAT_LINE_RE = re.compile(r"^\d{2}-\d{2} [\d:.]+ +([VDIWEF])/")
+
+
+class LogcatViewer:
+    LEVELS = ["V", "D", "I", "W", "E"]   # default I = noise floor most people want
+
+    def __init__(self, app: "APKInstaller"):
+        self.app = app
+        self.proc: subprocess.Popen | None = None
+        self.reader_thread: threading.Thread | None = None
+
+        win = tk.Toplevel(app.root)
+        app.logcat_win = win
+        self.win = win
+        win.title("Logcat")
+        win.configure(bg=T["bg"])
+        win.geometry("980x620")
+        win.minsize(720, 400)
+        win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._build(win)
+
+    def _build(self, win: tk.Toplevel):
+        # ── Filter bar ───────────────────────────────────────────────────────
+        bar = tk.Frame(win, bg=T["bg"], padx=12, pady=10)
+        bar.pack(fill=tk.X)
+
+        def lbl(parent, text):
+            return tk.Label(parent, text=text, bg=T["bg"], fg=T["subtext"],
+                            font=("Helvetica Neue", 10))
+
+        # Package
+        lbl(bar, "Package:").pack(side=tk.LEFT)
+        self.pkg_var = tk.StringVar()
+        tk.Entry(bar, textvariable=self.pkg_var, width=22,
+                 bg=T["raised"], fg=T["text"], insertbackground=T["text"],
+                 relief=tk.FLAT, font=("Menlo", 11),
+                 highlightbackground=T["border"], highlightthickness=1
+                 ).pack(side=tk.LEFT, padx=(6, 12))
+
+        # Level
+        lbl(bar, "Level:").pack(side=tk.LEFT)
+        self.level_var = tk.StringVar(value="I")
+        ttk.Combobox(bar, textvariable=self.level_var, values=self.LEVELS,
+                     state="readonly", style="Dark.TCombobox", width=4,
+                     font=("Menlo", 11)).pack(side=tk.LEFT, padx=(6, 12))
+
+        # Filter text
+        lbl(bar, "Filter:").pack(side=tk.LEFT)
+        self.filter_var = tk.StringVar()
+        tk.Entry(bar, textvariable=self.filter_var, width=22,
+                 bg=T["raised"], fg=T["text"], insertbackground=T["text"],
+                 relief=tk.FLAT, font=("Menlo", 11),
+                 highlightbackground=T["border"], highlightthickness=1
+                 ).pack(side=tk.LEFT, padx=(6, 12))
+
+        self.autoscroll_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(bar, text="auto-scroll", variable=self.autoscroll_var,
+                       bg=T["bg"], fg=T["text"], selectcolor=T["raised"],
+                       activebackground=T["bg"], activeforeground=T["text"],
+                       font=("Helvetica Neue", 10), bd=0
+                       ).pack(side=tk.LEFT)
+
+        # ── Action buttons ───────────────────────────────────────────────────
+        actions = tk.Frame(win, bg=T["bg"], padx=12)
+        actions.pack(fill=tk.X, pady=(0, 10))
+
+        self.start_btn = self.app._btn(actions, "▶ Start", self.start, variant="install")
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.stop_btn  = self.app._btn(actions, "⏹ Stop", self.stop, variant="close")
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.app._btn(actions, "Clear", self.clear,
+                      variant="secondary").pack(side=tk.LEFT)
+
+        self.status_label = tk.Label(actions, text="idle",
+                                     bg=T["bg"], fg=T["subtext"],
+                                     font=("Menlo", 10))
+        self.status_label.pack(side=tk.RIGHT)
+
+        # ── Output ───────────────────────────────────────────────────────────
+        body = tk.Frame(win, bg=T["bg"], padx=12)
+        body.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+
+        self.text = scrolledtext.ScrolledText(
+            body, bg=T["input"], fg=T["text"],
+            font=("Menlo", 10), relief=tk.FLAT, bd=0,
+            padx=8, pady=6, insertbackground=T["text"], wrap=tk.NONE)
+        self.text.pack(fill=tk.BOTH, expand=True)
+        self.text.config(state=tk.DISABLED)
+        self.text.tag_config("V", foreground=T["log_dim"])
+        self.text.tag_config("D", foreground=T["log_info"])
+        self.text.tag_config("I", foreground=T["text"])
+        self.text.tag_config("W", foreground=T["log_warn"])
+        self.text.tag_config("E", foreground=T["log_error"])
+        self.text.tag_config("F", foreground=T["log_error"])
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self):
+        if self.proc is not None:
+            return
+        device = self.app.selected_device.get()
+        if not device:
+            self._set_status("no device selected", T["log_error"])
+            return
+
+        # Resolve package → pid (best effort)
+        pkg = self.pkg_var.get().strip()
+        pid_arg: list[str] = []
+        if pkg:
+            try:
+                r = subprocess.run(
+                    self.app._adb_prefix() + ["shell", "pidof", pkg],
+                    capture_output=True, text=True, timeout=5)
+                pid = r.stdout.strip().split()
+                if pid:
+                    pid_arg = ["--pid=" + pid[0]]
+                else:
+                    self._set_status(f"{pkg} not running — showing all", T["log_warn"])
+            except Exception:
+                pass
+
+        cmd = self.app._adb_prefix() + ["logcat", "-v", "time",
+                                        f"*:{self.level_var.get()}"] + pid_arg
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+        except FileNotFoundError:
+            self._set_status("adb not found", T["log_error"])
+            return
+
+        self._set_status(f"streaming  ({device})", T["log_success"])
+        self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader_thread.start()
+
+    def stop(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=3)
+        except Exception:
+            try: self.proc.kill()
+            except Exception: pass
+        self.proc = None
+        self._set_status("stopped", T["subtext"])
+
+    def clear(self):
+        self.text.config(state=tk.NORMAL)
+        self.text.delete("1.0", tk.END)
+        self.text.config(state=tk.DISABLED)
+
+    def _read_loop(self):
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            return
+        for raw in proc.stdout:
+            if proc is not self.proc:   # superseded by another start
+                return
+            line = raw.rstrip("\n")
+            self.win.after(0, lambda l=line: self._append(l))
+        # Process ended
+        self.win.after(0, lambda: self._set_status("stopped", T["subtext"]))
+
+    def _append(self, line: str):
+        needle = self.filter_var.get().strip().lower()
+        if needle and needle not in line.lower():
+            return
+        m = LOGCAT_LINE_RE.match(line)
+        tag = m.group(1) if m else ""
+        self.text.config(state=tk.NORMAL)
+        self.text.insert(tk.END, line + "\n", tag)
+        # Cap buffer at ~5000 lines so memory doesn't run away
+        line_count = int(self.text.index("end-1c").split(".")[0])
+        if line_count > 5000:
+            self.text.delete("1.0", f"{line_count - 5000}.0")
+        if self.autoscroll_var.get():
+            self.text.see(tk.END)
+        self.text.config(state=tk.DISABLED)
+
+    def _set_status(self, text: str, color: str):
+        self.status_label.config(text=text, fg=color)
+
+    def _on_close(self):
+        self.stop()
+        self.app.logcat_win = None
+        self.win.destroy()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

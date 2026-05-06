@@ -123,9 +123,22 @@ To revert: select the TCP device in the dropdown and click
 
 ```
 AdbGui/
-├── apk_installer.py                 # the whole app
+├── apk_installer.py                 # entry point — `python3 apk_installer.py`
 ├── requirements.txt
 ├── README.md
 ├── .apk_installer_settings.json     # settings (hidden, auto-created)
-└── captures/                        # screenshots and recordings (auto-created)
+├── captures/                        # screenshots & recordings (auto-created)
+└── src/
+    ├── __init__.py
+    ├── theme.py                     # colour palette, button styles, paths
+    ├── dnd.py                       # tkinterdnd2 import shim
+    ├── widgets.py                   # make_button, ttk style setup
+    ├── adb.py                       # pure adb command helpers (no UI)
+    ├── settings.py                  # JSON load/save
+    ├── logcat.py                    # LogcatViewer Toplevel
+    ├── dialogs.py                   # settings dialog + package picker
+    └── app.py                       # APKInstaller (main window)
 ```
+
+Module dependencies form a strict DAG: `theme` → `widgets`/`adb`/`settings` →
+`logcat`/`dialogs` → `app` → `apk_installer.py`. No cycles.

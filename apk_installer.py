@@ -57,6 +57,10 @@ T = {
     "btn_net_fg":       "#ffffff",
     "btn_net_hover":    "#22808f",
 
+    "btn_close_bg":     "#8b3a3a",   # muted red — destructive / stop
+    "btn_close_fg":     "#ffffff",
+    "btn_close_hover":  "#a04a4a",
+
     # ── Log tag colours ───────────────────────────────────────────────────────
     "log_success": "#3fb950",
     "log_error":   "#f85149",
@@ -195,7 +199,15 @@ class APKInstaller:
         self._btn(pad, "Install APK",      self._install_apk,        variant="install").pack(fill=tk.X, pady=(0, 6))
         self._btn(pad, "Launch scrcpy",    self._launch_scrcpy,      variant="scrcpy").pack(fill=tk.X,  pady=(0, 6))
         self._btn(pad, "Install + Launch", self._install_and_launch, variant="combo").pack(fill=tk.X,   pady=(0, 6))
-        self._btn(pad, "📡  Wi-Fi ADB",    self._enable_wifi_adb,    variant="network").pack(fill=tk.X)
+
+        self.wifi_btn = self._btn(pad, "📡  Wi-Fi ADB",    self._enable_wifi_adb,
+                                  variant="network")
+        self.wifi_btn.pack(fill=tk.X)
+
+        # Visible only when the selected device is TCP-connected (IP:port serial)
+        self.close_btn = self._btn(pad, "🔌  Close Wi-Fi ADB", self._close_wifi_adb,
+                                   variant="close")
+        self.selected_device.trace_add("write", lambda *_: self._update_close_btn())
 
         # Custom action buttons (rebuilt whenever settings change)
         self.custom_sep = tk.Frame(pad, bg=T["border"], height=1)
@@ -234,6 +246,7 @@ class APKInstaller:
         "combo":     ("btn_combo_bg",    "btn_combo_fg",   "btn_combo_bg",         12, 8),
         "custom":    ("btn_custom_bg",   "btn_custom_fg",  "btn_custom_hover",     12, 8),
         "network":   ("btn_net_bg",      "btn_net_fg",     "btn_net_hover",        12, 8),
+        "close":     ("btn_close_bg",    "btn_close_fg",   "btn_close_hover",      12, 8),
     }
 
     def _btn(self, parent, text, command, variant="secondary", width=None):
@@ -374,6 +387,36 @@ class APKInstaller:
                 self.root.after(500, self._refresh_devices)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _close_wifi_adb(self):
+        """Switch a TCP-connected device back to USB mode and disconnect."""
+        dev = self.selected_device.get()
+        if not self._is_tcp_device(dev):
+            self._log("Selected device is not on TCP/IP", "error")
+            return
+
+        def run():
+            self._exec(["adb", "-s", dev, "usb"],
+                       success_msg="✓ Device switched back to USB mode")
+            self._exec(["adb", "disconnect", dev],
+                       success_msg=f"✓ Disconnected {dev}")
+            self.root.after(500, self._refresh_devices)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _is_tcp_device(serial: str) -> bool:
+        """A TCP serial looks like '192.168.x.y:5555'. USB serials never contain ':'."""
+        if ":" not in serial:
+            return False
+        host = serial.rsplit(":", 1)[0]
+        return host.count(".") == 3
+
+    def _update_close_btn(self):
+        if self._is_tcp_device(self.selected_device.get()):
+            self.close_btn.pack(fill=tk.X, pady=(6, 0), after=self.wifi_btn)
+        else:
+            self.close_btn.pack_forget()
 
     def _get_device_ip(self) -> str | None:
         """Best-effort device IP lookup via `adb shell ip -4 route`."""

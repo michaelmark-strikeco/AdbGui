@@ -516,7 +516,8 @@ class APKInstaller:
         self.root.after(0, lambda: self._log("$ " + " ".join(cmd), "dim"))
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True)
+                                    stderr=subprocess.STDOUT,
+                                    text=True, errors="replace")
             for line in proc.stdout:
                 line = line.rstrip()
                 if line:
@@ -1037,7 +1038,7 @@ class LogcatViewer:
         try:
             self.proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1)
+                text=True, errors="replace", bufsize=1)
         except FileNotFoundError:
             self._set_status("adb not found", T["log_error"])
             return
